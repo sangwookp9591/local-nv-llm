@@ -1,11 +1,14 @@
 import readline from "node:readline";
 import chalk from "chalk";
-import { LlmProvider, ChatMessage } from "../providers/provider.js";
+import { LlmProvider } from "../providers/provider.js";
 import { SessionData, SessionStore } from "../sessions/session-store.js";
 import { ContextManager } from "../sessions/context-manager.js";
 import { parseSlashCommand, KNOWN_SLASH_COMMANDS } from "./slash-commands.js";
+import { detectLocalIntent } from "../cli/local-intent-router.js";
+import { buildSystemPrompt, RuntimeContext } from "../prompts/system-prompt.js";
 import { ToolRegistry } from "../agent/tool-registry.js";
 import { PatchManager } from "../agent/patch-manager.js";
+import { AgentLoop } from "../agent/agent-loop.js";
 import { maskApiKey, redactSensitiveText } from "../auth/redaction.js";
 
 export interface ReplOptions {
@@ -29,7 +32,6 @@ export class TerminalRepl {
     this.options = options;
     this.toolRegistry = new ToolRegistry(options.cwd, options.patchManager);
 
-    // Existing session or create new
     const existing = options.sessionStore.getLatestSession(options.cwd);
     if (existing) {
       this.session = existing;
@@ -67,7 +69,7 @@ export class TerminalRepl {
         continue;
       }
 
-      // Check slash commands
+      // 1. Slash command check
       const slash = parseSlashCommand(trimmed);
       if (slash) {
         const shouldExit = await this.handleSlashCommand(slash);
@@ -79,10 +81,66 @@ export class TerminalRepl {
         continue;
       }
 
-      // Process normal prompt
+      // 2. Natural language Local Intent check
+      const localIntent = detectLocalIntent(trimmed);
+      if (localIntent) {
+        await this.handleLocalIntent(localIntent);
+        rl.prompt();
+        continue;
+      }
+
+      // 3. LLM Agent Runtime execution
       await this.handleUserPrompt(trimmed);
       this.options.sessionStore.saveSession(this.session);
       rl.prompt();
+    }
+  }
+
+  private async handleLocalIntent(intent: string): Promise<void> {
+    switch (intent) {
+      case "LIST_MODELS": {
+        console.log(chalk.bold.cyan("\n사용 가능한 NVIDIA 모델 목록\n"));
+        console.log(`현재 선택된 모델: ● ${chalk.green(this.session.modelId)}\n`);
+        try {
+          const models = await this.options.provider.listModels(this.options.apiKey);
+          models.forEach((m, idx) => {
+            const caps = [
+              m.coding ? "Coding" : null,
+              m.reasoning ? "Reasoning" : null,
+              m.toolCalling ? "Tool Calling" : null,
+            ]
+              .filter(Boolean)
+              .join(" · ");
+            console.log(`  ${idx + 1}. ${chalk.bold(m.id)}`);
+            console.log(`     ${chalk.dim(caps || "Chat")}`);
+          });
+          console.log(
+            chalk.dim(`\n총 ${models.length}개 모델 (/model <id> 로 변경할 수 있습니다.)\n`)
+          );
+        } catch {
+          console.log(chalk.red("모델 목록 조회에 실패했습니다."));
+        }
+        break;
+      }
+
+      case "CURRENT_MODEL": {
+        console.log(chalk.bold(`\n현재 선택된 모델: ${chalk.green(this.session.modelId)}`));
+        console.log(`- Provider: NVIDIA API`);
+        console.log(`- Mode: ${this.session.mode.toUpperCase()}`);
+        console.log(`- Working directory: ${this.options.cwd}\n`);
+        break;
+      }
+
+      case "CURRENT_STATUS": {
+        console.log(chalk.bold("\n[현재 세션 상태]"));
+        console.log(`Provider: NVIDIA Build`);
+        console.log(`Model: ${this.session.modelId}`);
+        console.log(`Mode: ${this.session.mode.toUpperCase()}`);
+        console.log(`Directory: ${this.options.cwd}`);
+        console.log(`Session ID: ${this.session.id}`);
+        console.log(`API Key: ${maskApiKey(this.options.apiKey)}\n`);
+        break;
+      }
     }
   }
 
@@ -111,14 +169,7 @@ export class TerminalRepl {
         return false;
 
       case "status":
-        console.log(chalk.bold("\n[현재 세션 상태]"));
-        console.log(`Provider: NVIDIA Build`);
-        console.log(`Model: ${this.session.modelId}`);
-        console.log(`Mode: ${this.session.mode.toUpperCase()}`);
-        console.log(`Directory: ${this.options.cwd}`);
-        console.log(`Session ID: ${this.session.id}`);
-        console.log(`Context Messages: ${this.session.messages.length}`);
-        console.log(`API Key: ${maskApiKey(this.options.apiKey)}\n`);
+        await this.handleLocalIntent("CURRENT_STATUS");
         return false;
 
       case "model":
@@ -126,20 +177,12 @@ export class TerminalRepl {
           this.session.modelId = slash.args.trim();
           console.log(chalk.green(`✓ 모델이 변경되었습니다: ${this.session.modelId}`));
         } else {
-          console.log(`현재 설정된 모델: ${chalk.bold(this.session.modelId)}`);
+          await this.handleLocalIntent("CURRENT_MODEL");
         }
         return false;
 
       case "models":
-        console.log(chalk.cyan("사용 가능한 모델 목록을 조회하는 중..."));
-        try {
-          const models = await this.options.provider.listModels(this.options.apiKey);
-          for (const m of models) {
-            console.log(`- ${chalk.bold(m.id)} (${m.name})`);
-          }
-        } catch {
-          console.log(chalk.red("모델 목록 조회가 원활하지 않습니다."));
-        }
+        await this.handleLocalIntent("LIST_MODELS");
         return false;
 
       case "undo": {
@@ -182,94 +225,54 @@ export class TerminalRepl {
   }
 
   private async handleUserPrompt(prompt: string): Promise<void> {
-    const userMsg: ChatMessage = { role: "user", content: prompt };
-    this.contextManager.addMessage(userMsg);
+    this.contextManager.addMessage({ role: "user", content: prompt });
 
-    const systemPrompt =
-      this.session.mode === "agent"
-        ? "You are NV, an expert terminal AI coding agent. You can read, write files, and inspect the project when needed."
-        : "You are NV, an expert terminal AI assistant.";
+    const runtimeContext: RuntimeContext = {
+      applicationName: "NV Terminal AI",
+      provider: "NVIDIA",
+      modelId: this.session.modelId,
+      mode: this.session.mode,
+      workingDirectory: this.options.cwd,
+      sessionId: this.session.id,
+      tools: this.toolRegistry.getToolDefinitions().map((t) => t.function.name),
+      toolCallingSupported: true,
+    };
 
+    const systemPrompt = buildSystemPrompt(runtimeContext);
     const messages = this.contextManager.getEffectiveMessages(systemPrompt);
-    const tools = this.session.mode === "agent" ? this.toolRegistry.getToolDefinitions() : undefined;
 
     console.log(chalk.blue.bold("\nNV:"));
 
-    let fullAssistantContent = "";
-    const pendingToolCalls: Array<{ id: string; name: string; argsStr: string }> = [];
-
-    const request = {
-      model: this.session.modelId,
-      messages,
-      tools,
-      stream: true,
-    };
+    const agentLoop = new AgentLoop({
+      provider: this.options.provider,
+      apiKey: this.options.apiKey,
+      toolRegistry: this.toolRegistry,
+      maxSteps: 10,
+    });
 
     try {
-      for await (const chunk of this.options.provider.chat(this.options.apiKey, request)) {
-        if (chunk.type === "reasoning" && chunk.reasoning) {
-          process.stdout.write(chalk.magenta.dim(chunk.reasoning));
-        } else if (chunk.type === "content" && chunk.content) {
-          fullAssistantContent += chunk.content;
-          process.stdout.write(redactSensitiveText(chunk.content, [this.options.apiKey]));
-        } else if (chunk.type === "tool_call" && chunk.toolCall) {
-          const tc = chunk.toolCall;
-          if (tc.name) {
-            pendingToolCalls.push({
-              id: tc.id || `call_${Date.now()}`,
-              name: tc.name,
-              argsStr: tc.argumentsDelta || "",
-            });
-          } else if (pendingToolCalls.length > 0 && tc.argumentsDelta) {
-            pendingToolCalls[pendingToolCalls.length - 1].argsStr += tc.argumentsDelta;
-          }
-        } else if (chunk.type === "error" && chunk.error) {
-          console.log(chalk.red(`\n오류: ${chunk.error}`));
-        }
-      }
-      console.log("\n");
-
-      if (fullAssistantContent) {
-        this.contextManager.addMessage({
-          role: "assistant",
-          content: fullAssistantContent,
-        });
-      }
-
-      // Handle tool calls if agent mode
-      if (pendingToolCalls.length > 0 && this.session.mode === "agent") {
-        for (const toolCall of pendingToolCalls) {
-          console.log(chalk.yellow(`🛠️ Tool 실행 요청: ${toolCall.name}`));
-          let parsedArgs: Record<string, unknown> = {};
-          try {
-            parsedArgs = JSON.parse(toolCall.argsStr);
-          } catch {
-            parsedArgs = {};
-          }
-
-          const res = await this.toolRegistry.executeTool(
-            toolCall.name,
-            parsedArgs,
-            this.session.id
-          );
-
-          if (res.success) {
-            console.log(chalk.green(`✓ Tool 결과:\n${res.output}`));
-            this.contextManager.addMessage({
-              role: "tool",
-              content: res.output || "Success",
-              tool_call_id: toolCall.id,
-            });
+      const result = await agentLoop.run({
+        modelId: this.session.modelId,
+        messages,
+        sessionId: this.session.id,
+        onChunk: (chunk) => {
+          process.stdout.write(redactSensitiveText(chunk, [this.options.apiKey]));
+        },
+        onToolStart: (name) => {
+          console.log(chalk.yellow(`\n◆ ${name} 실행 중...`));
+        },
+        onToolEnd: (name, output, success) => {
+          if (success) {
+            console.log(chalk.green(`✓ ${name} 성공`));
           } else {
-            console.log(chalk.red(`✗ Tool 실행 실패: ${res.error}`));
-            this.contextManager.addMessage({
-              role: "tool",
-              content: `Error: ${res.error}`,
-              tool_call_id: toolCall.id,
-            });
+            console.log(chalk.red(`✗ ${name} 실패: ${output}`));
           }
-        }
-      }
+        },
+      });
+
+      console.log("\n");
+      // Update effective messages into session
+      this.session.messages = result.messages.filter((m) => m.role !== "system");
     } catch (err: unknown) {
       console.log(chalk.red(`\n오류가 발생했습니다: ${err instanceof Error ? err.message : String(err)}\n`));
     }
