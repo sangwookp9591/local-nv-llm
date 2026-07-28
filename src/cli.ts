@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import chalk from "chalk";
+import readline from "node:readline";
 import { CredentialStore } from "./auth/credential-store.js";
 import { ConfigStore } from "./config/config-store.js";
 import { NvidiaProvider } from "./providers/nvidia/client.js";
@@ -8,7 +9,6 @@ import { runNonInteractivePrompt } from "./commands/non-interactive.js";
 import { maskApiKey } from "./auth/redaction.js";
 import { SessionStore } from "./sessions/session-store.js";
 import { PatchManager } from "./agent/patch-manager.js";
-import readline from "node:readline";
 
 const program = new Command();
 const credStore = new CredentialStore();
@@ -16,6 +16,89 @@ const configStore = new ConfigStore();
 const provider = new NvidiaProvider();
 const sessionStore = new SessionStore();
 const patchManager = new PatchManager();
+
+async function ensureAuthenticated(): Promise<string> {
+  const cred = credStore.getApiKeyInfo();
+  if (cred.apiKey) return cred.apiKey;
+
+  console.log(chalk.cyan.bold("\nNV — NVIDIA Terminal AI\n"));
+  console.log(chalk.yellow("NVIDIA API Key가 설정되어 있지 않습니다."));
+  console.log(chalk.dim("API Key는 https://build.nvidia.com 에서 발급받을 수 있습니다.\n"));
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const keyInput = await new Promise<string>((resolve) => {
+    rl.question(chalk.bold("API Key를 입력하세요: "), (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+
+  if (!keyInput) {
+    console.log(chalk.red("API Key가 입력되지 않았습니다. 종료합니다."));
+    process.exit(1);
+  }
+
+  console.log(chalk.cyan("✓ NVIDIA API Key 유효성을 검증하는 중..."));
+  try {
+    const isValid = await provider.validateCredential(keyInput);
+    if (!isValid) {
+      console.log(chalk.red("✗ 유효하지 않은 NVIDIA API Key입니다. 키를 확인해 주세요."));
+      process.exit(1);
+    }
+    credStore.setApiKey(keyInput);
+    console.log(chalk.green("✓ NVIDIA API Key 확인 완료 및 자격 증명 저장소에 저장되었습니다.\n"));
+    return keyInput;
+  } catch (err: unknown) {
+    console.log(chalk.red(`✗ 인증 검증 중 오류 발생: ${err instanceof Error ? err.message : err}`));
+    process.exit(1);
+  }
+}
+
+async function runCliSession(options: {
+  prompt?: string;
+  model?: string;
+  json?: boolean;
+  mode?: "chat" | "agent";
+  plan?: boolean;
+}) {
+  const cwd = process.cwd();
+  const config = configStore.loadConfig(
+    cwd,
+    options.model ? { defaultModel: options.model } : {}
+  );
+  const activeApiKey = await ensureAuthenticated();
+  const mode = options.mode ?? "chat";
+
+  // Non-interactive execution (-p)
+  if (options.prompt) {
+    try {
+      const finalPrompt = options.plan
+        ? `[PLAN MODE]: 다음 요청에 대해 파일 조작 없이 탐색 및 구체적 변경 계획을 수립해줘.\n${options.prompt}`
+        : options.prompt;
+
+      const output = await runNonInteractivePrompt({
+        prompt: finalPrompt,
+        apiKey: activeApiKey,
+        modelId: config.defaultModel,
+        json: options.json,
+      });
+      console.log(output);
+    } catch (err: unknown) {
+      console.error(chalk.red(`오류: ${err instanceof Error ? err.message : String(err)}`));
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Interactive Mode header
+  console.log(chalk.cyan.bold(`\nNV Terminal AI (${mode.toUpperCase()} MODE)`));
+  console.log(chalk.dim(`Model: ${config.defaultModel} | Directory: ${cwd}\n`));
+  console.log(chalk.yellow("대화형 셸 준비 완료. (/help 명령어로 사용 가능 도움말 확인)\n"));
+}
 
 program
   .name("nv")
@@ -25,71 +108,30 @@ program
   .option("-m, --model <model-id>", "NVIDIA model ID to use")
   .option("--json", "Output response in JSON format")
   .action(async (options) => {
-    const cwd = process.cwd();
-    const config = configStore.loadConfig(cwd, options.model ? { defaultModel: options.model } : {});
-    const cred = credStore.getApiKeyInfo();
+    await runCliSession({ ...options, mode: "chat" });
+  });
 
-    // Check API Key existence
-    if (!cred.apiKey) {
-      console.log(chalk.cyan.bold("\nNV — NVIDIA Terminal AI\n"));
-      console.log(chalk.yellow("NVIDIA API Key가 설정되어 있지 않습니다."));
-      console.log(chalk.dim("API Key는 https://build.nvidia.com 에서 발급받을 수 있습니다.\n"));
+// nv agent subcommand
+program
+  .command("agent")
+  .description("Run NV in Agent mode (Tool Calling, File edits, Patch tracking)")
+  .option("-p, --prompt <text>", "Run non-interactive prompt in agent mode")
+  .option("-m, --model <model-id>", "NVIDIA model ID to use")
+  .option("--json", "Output response in JSON format")
+  .option("--plan", "Run in Read-only Plan mode")
+  .action(async (options) => {
+    await runCliSession({ ...options, mode: "agent" });
+  });
 
-      const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-      });
-
-      const keyInput = await new Promise<string>((resolve) => {
-        rl.question(chalk.bold("API Key를 입력하세요: "), (answer) => {
-          rl.close();
-          resolve(answer.trim());
-        });
-      });
-
-      if (!keyInput) {
-        console.log(chalk.red("API Key가 입력되지 않았습니다. 종료합니다."));
-        process.exit(1);
-      }
-
-      console.log(chalk.cyan("✓ NVIDIA API Key 유효성을 검증하는 중..."));
-      try {
-        const isValid = await provider.validateCredential(keyInput);
-        if (!isValid) {
-          console.log(chalk.red("✗ 유효하지 않은 NVIDIA API Key입니다. 키를 확인해 주세요."));
-          process.exit(1);
-        }
-        credStore.setApiKey(keyInput);
-        console.log(chalk.green("✓ NVIDIA API Key 확인 완료 및 자격 증명 저장소에 저장되었습니다.\n"));
-      } catch (err: unknown) {
-        console.log(chalk.red(`✗ 인증 검증 중 오류 발생: ${err instanceof Error ? err.message : err}`));
-        process.exit(1);
-      }
-    }
-
-    const activeApiKey = credStore.getApiKeyInfo().apiKey!;
-
-    // 1. Non-interactive mode with -p
-    if (options.prompt) {
-      try {
-        const output = await runNonInteractivePrompt({
-          prompt: options.prompt,
-          apiKey: activeApiKey,
-          modelId: config.defaultModel,
-          json: options.json,
-        });
-        console.log(output);
-      } catch (err: unknown) {
-        console.error(chalk.red(`오류: ${err instanceof Error ? err.message : String(err)}`));
-        process.exit(1);
-      }
-      return;
-    }
-
-    // 2. Interactive Mode header
-    console.log(chalk.cyan.bold("\nNV Terminal AI Agent"));
-    console.log(chalk.dim(`Model: ${config.defaultModel} | Directory: ${cwd}\n`));
-    console.log(chalk.yellow("대화형 셸 준비 완료. (/help 명령어로 사용 가능 도움말 확인)\n"));
+// nv chat subcommand
+program
+  .command("chat")
+  .description("Run NV in Chat mode (General conversation & Q&A)")
+  .option("-p, --prompt <text>", "Run non-interactive prompt in chat mode")
+  .option("-m, --model <model-id>", "NVIDIA model ID to use")
+  .option("--json", "Output response in JSON format")
+  .action(async (options) => {
+    await runCliSession({ ...options, mode: "chat" });
   });
 
 // Subcommands
@@ -215,6 +257,22 @@ program
       console.log(`- ${chalk.cyan(s.id)} (${s.modelId}) - ${s.updatedAt}`);
     }
     console.log();
+  });
+
+program
+  .command("resume [sessionId]")
+  .description("Resume a previous conversation session")
+  .action((sessionId?: string) => {
+    const cwd = process.cwd();
+    const session = sessionId
+      ? sessionStore.getSession(cwd, sessionId)
+      : sessionStore.getLatestSession(cwd);
+
+    if (!session) {
+      console.log(chalk.red(`세션을 찾을 수 없습니다: ${sessionId || "latest"}`));
+      return;
+    }
+    console.log(chalk.green(`✓ 세션 복원 성공: ${session.id} (${session.modelId})`));
   });
 
 program.parse(process.argv);
