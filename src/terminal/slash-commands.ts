@@ -26,6 +26,12 @@ export const KNOWN_SLASH_COMMANDS = [
   "undo",
   "shell",
   "exit",
+  "limits",
+  "rate",
+  "queue",
+  "usage",
+  "retries",
+  "continue",
 ];
 
 export function parseSlashCommand(input: string): SlashCommand | null {

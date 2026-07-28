@@ -8,21 +8,25 @@ import {
   ModelCapability,
 } from "../provider.js";
 import { parseSseStream } from "./stream.js";
-import {
-  BUNDLED_MODELS,
-  normalizeModelCapability,
-} from "./capabilities.js";
+import { BUNDLED_MODELS, normalizeModelCapability } from "./capabilities.js";
 import { normalizeNvidiaError } from "./errors.js";
+import { RequestScheduler } from "../../rate-limit/request-scheduler.js";
 
 export class NvidiaProvider implements LlmProvider {
   private baseUrl = "https://integrate.api.nvidia.com/v1";
   private cacheFilePath: string;
+  private scheduler: RequestScheduler;
 
-  constructor() {
+  constructor(scheduler?: RequestScheduler) {
     const configHome =
       process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
     const cacheDir = path.join(configHome, "nv");
     this.cacheFilePath = path.join(cacheDir, "models-cache.json");
+    this.scheduler = scheduler ?? new RequestScheduler();
+  }
+
+  public getScheduler(): RequestScheduler {
+    return this.scheduler;
   }
 
   public async validateCredential(apiKey: string): Promise<boolean> {
@@ -33,20 +37,27 @@ export class NvidiaProvider implements LlmProvider {
     }
 
     try {
-      const response = await fetch(`${this.baseUrl}/models`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${trimmed}`,
-          Accept: "application/json",
+      return await this.scheduler.schedule({
+        provider: "nvidia",
+        modelId: "validation",
+        apiKey: trimmed,
+        requestType: "validateCredential",
+        priority: "maintenance",
+        execute: async () => {
+          const response = await fetch(`${this.baseUrl}/models`, {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${trimmed}`,
+              Accept: "application/json",
+            },
+          });
+          if (response.status === 401 || response.status === 403) {
+            return false;
+          }
+          return response.ok;
         },
       });
-
-      if (response.status === 401 || response.status === 403) {
-        return false;
-      }
-      return response.ok;
     } catch (err) {
-      // Network failure vs Authentication failure handling
       throw normalizeNvidiaError(err);
     }
   }
@@ -55,34 +66,42 @@ export class NvidiaProvider implements LlmProvider {
     const trimmed = apiKey.trim();
 
     try {
-      const response = await fetch(`${this.baseUrl}/models`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${trimmed}`,
-          Accept: "application/json",
+      const models = await this.scheduler.schedule({
+        provider: "nvidia",
+        modelId: "catalog",
+        apiKey: trimmed,
+        requestType: "listModels",
+        priority: "interactive",
+        execute: async () => {
+          const response = await fetch(`${this.baseUrl}/models`, {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${trimmed}`,
+              Accept: "application/json",
+            },
+          });
+
+          if (response.ok) {
+            const body = (await response.json()) as { data?: Record<string, unknown>[] };
+            if (Array.isArray(body.data) && body.data.length > 0) {
+              const items = body.data.map(normalizeModelCapability);
+              this.saveModelCache(items);
+              return items;
+            }
+          }
+          throw new Error("Failed to fetch models");
         },
       });
-
-      if (response.ok) {
-        const body = (await response.json()) as { data?: Record<string, unknown>[] };
-        if (Array.isArray(body.data) && body.data.length > 0) {
-          const models = body.data.map(normalizeModelCapability);
-          this.saveModelCache(models);
-          return models;
-        }
-      }
+      return models;
     } catch {
-      // fallback on failure
+      // Fallback 1: Cached models
+      const cached = this.loadModelCache();
+      if (cached && cached.length > 0) {
+        return cached;
+      }
+      // Fallback 2: Bundled models
+      return BUNDLED_MODELS;
     }
-
-    // Fallback 1: Cached models
-    const cached = this.loadModelCache();
-    if (cached && cached.length > 0) {
-      return cached;
-    }
-
-    // Fallback 2: Bundled models
-    return BUNDLED_MODELS;
   }
 
   private saveModelCache(models: ModelCapability[]): void {
@@ -133,38 +152,50 @@ export class NvidiaProvider implements LlmProvider {
     }
 
     try {
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${trimmed}`,
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
+      const responseStream = await this.scheduler.schedule({
+        provider: "nvidia",
+        modelId: request.model,
+        apiKey: trimmed,
+        requestType: "chat",
+        priority: "interactive",
+        execute: async (signal) => {
+          const response = await fetch(`${this.baseUrl}/chat/completions`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${trimmed}`,
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+            },
+            body: JSON.stringify(payload),
+            signal: request.signal || signal,
+          });
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            let errorMsg = `NVIDIA API Error (${response.status}): ${response.statusText}`;
+            try {
+              const errObj = JSON.parse(errorText);
+              if (errObj.error?.message) {
+                errorMsg = errObj.error.message;
+              }
+            } catch {
+              // ignore
+            }
+            const errObj = new Error(errorMsg);
+            (errObj as any).statusCode = response.status;
+            (errObj as any).headers = response.headers;
+            throw normalizeNvidiaError(errObj);
+          }
+
+          if (!response.body) {
+            throw new Error("API 응답 바디가 비어 있습니다.");
+          }
+
+          return response.body as unknown as AsyncIterable<Uint8Array>;
         },
-        body: JSON.stringify(payload),
-        signal: request.signal,
       });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        let errorMsg = `NVIDIA API Error (${response.status}): ${response.statusText}`;
-        try {
-          const errObj = JSON.parse(errorText);
-          if (errObj.error?.message) {
-            errorMsg = errObj.error.message;
-          }
-        } catch {
-          // ignore
-        }
-        throw normalizeNvidiaError(new Error(errorMsg));
-      }
-
-      if (!response.body) {
-        throw new Error("API 응답 바디가 비어 있습니다.");
-      }
-
-      // Read SSE Stream
-      const webStream = response.body as unknown as AsyncIterable<Uint8Array>;
-      yield* parseSseStream(webStream);
+      yield* parseSseStream(responseStream);
     } catch (err) {
       const norm = normalizeNvidiaError(err);
       yield { type: "error", error: norm.message };

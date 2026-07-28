@@ -10,6 +10,7 @@ import { ToolRegistry } from "../agent/tool-registry.js";
 import { PatchManager } from "../agent/patch-manager.js";
 import { AgentLoop } from "../agent/agent-loop.js";
 import { maskApiKey, redactSensitiveText } from "../auth/redaction.js";
+import { NvidiaProvider } from "../providers/nvidia/client.js";
 
 export interface ReplOptions {
   provider: LlmProvider;
@@ -145,6 +146,9 @@ export class TerminalRepl {
   }
 
   private async handleSlashCommand(slash: { command: string; args: string }): Promise<boolean> {
+    const nvidiaProvider = this.options.provider as NvidiaProvider;
+    const scheduler = nvidiaProvider.getScheduler?.();
+
     switch (slash.command) {
       case "exit":
         console.log(chalk.yellow("NV CLI를 종료합니다. 세션이 저장되었습니다."));
@@ -167,6 +171,55 @@ export class TerminalRepl {
         }
         console.log();
         return false;
+
+      case "limits":
+      case "rate": {
+        if (slash.args === "reset" && scheduler) {
+          scheduler.resetMetrics();
+          console.log(chalk.green("✓ Rate Limit 상태 및 Adaptive metrics가 초기화되었습니다."));
+          return false;
+        }
+
+        if (scheduler) {
+          const mgr = scheduler.getDomainManager();
+          const cfg = mgr.getConfig();
+          const domain = mgr.getEffectiveDomain(this.options.apiKey, this.session.modelId);
+          const metrics = scheduler.getMetrics();
+
+          console.log(chalk.bold.cyan("\nNVIDIA Rate Limit & Request Control Status\n"));
+          console.log(`Mode: ${chalk.bold(cfg.mode.toUpperCase())}`);
+          console.log(`Configured Fallback RPM: ${cfg.fallbackRpm}`);
+          console.log(`Configured Maximum RPM: ${cfg.maxRpm}`);
+          console.log(`Current Concurrency: ${domain.effectiveConcurrency} / ${cfg.maxConcurrency}`);
+          console.log(`Observed Ceiling: ${domain.globalDomain.controller.getObservedCeiling() ?? "None"}`);
+          console.log(`429 Responses: ${metrics.rateLimited429Count}`);
+          console.log(`503 Responses: ${metrics.serverError503Count}`);
+          console.log(`Current Queue Length: ${scheduler.getQueueLength()}\n`);
+        }
+        return false;
+      }
+
+      case "queue": {
+        if (scheduler) {
+          console.log(chalk.bold.cyan(`\n현재 요청 대기열 (Queue): ${scheduler.getQueueLength()}개 항목`));
+        }
+        return false;
+      }
+
+      case "usage": {
+        if (scheduler) {
+          const metrics = scheduler.getMetrics();
+          console.log(chalk.bold.cyan("\n[세션 요청 사용량 메트릭]"));
+          console.log(`Total Model Calls: ${metrics.totalRequests}`);
+          console.log(`Successful: ${metrics.successfulRequests}`);
+          console.log(`Retried: ${metrics.retriedRequests}`);
+          console.log(`HTTP 429 Count: ${metrics.rateLimited429Count}`);
+          console.log(`HTTP 503 Count: ${metrics.serverError503Count}`);
+          console.log(`Total Queued Time: ${(metrics.totalQueuedMs / 1000).toFixed(1)}s`);
+          console.log(`Total API Exec Time: ${(metrics.totalExecutionMs / 1000).toFixed(1)}s\n`);
+        }
+        return false;
+      }
 
       case "status":
         await this.handleLocalIntent("CURRENT_STATUS");

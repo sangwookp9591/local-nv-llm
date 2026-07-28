@@ -86,6 +86,9 @@ async function runCliSession(options: {
         apiKey: activeApiKey,
         modelId: config.defaultModel,
         json: options.json,
+        provider,
+        mode,
+        cwd,
       });
       console.log(output);
     } catch (err: unknown) {
@@ -148,7 +151,64 @@ program
     await runCliSession({ ...options, mode: "chat" });
   });
 
-// Subcommands
+// nv limits subcommand
+const limitsCmd = program.command("limits").description("Check or configure Rate Limit settings");
+
+limitsCmd
+  .command("status")
+  .description("Show current NVIDIA Rate Limit status")
+  .action(() => {
+    const scheduler = provider.getScheduler();
+    const mgr = scheduler.getDomainManager();
+    const cfg = mgr.getConfig();
+    const metrics = scheduler.getMetrics();
+
+    console.log(chalk.bold.cyan("\nNVIDIA Rate Limit Configuration & Status\n"));
+    console.log(`Mode: ${chalk.bold(cfg.mode.toUpperCase())}`);
+    console.log(`Configured Fallback RPM: ${cfg.fallbackRpm}`);
+    console.log(`Configured Maximum RPM: ${cfg.maxRpm}`);
+    console.log(`Max Concurrency: ${cfg.maxConcurrency}`);
+    console.log(`429 Count: ${metrics.rateLimited429Count}`);
+    console.log(`503 Count: ${metrics.serverError503Count}`);
+    console.log(`Queue Length: ${scheduler.getQueueLength()}\n`);
+  });
+
+limitsCmd
+  .command("reset")
+  .description("Reset adaptive rate limit states")
+  .action(() => {
+    const scheduler = provider.getScheduler();
+    scheduler.resetMetrics();
+    console.log(chalk.green("✓ Rate limit metrics and adaptive states reset."));
+  });
+
+// nv queue subcommand
+program
+  .command("queue")
+  .description("Show current pending request queue")
+  .action(() => {
+    const scheduler = provider.getScheduler();
+    console.log(chalk.cyan(`\nPending Request Queue: ${scheduler.getQueueLength()} items\n`));
+  });
+
+// nv usage subcommand
+program
+  .command("usage")
+  .description("Show API call usage metrics")
+  .action(() => {
+    const scheduler = provider.getScheduler();
+    const metrics = scheduler.getMetrics();
+    console.log(chalk.bold.cyan("\n[API Request Usage Metrics]"));
+    console.log(`Total Requests: ${metrics.totalRequests}`);
+    console.log(`Successful: ${metrics.successfulRequests}`);
+    console.log(`Retried: ${metrics.retriedRequests}`);
+    console.log(`HTTP 429: ${metrics.rateLimited429Count}`);
+    console.log(`HTTP 503: ${metrics.serverError503Count}`);
+    console.log(`Queued Time: ${(metrics.totalQueuedMs / 1000).toFixed(1)}s`);
+    console.log(`API Exec Time: ${(metrics.totalExecutionMs / 1000).toFixed(1)}s\n`);
+  });
+
+// Auth Subcommands
 const authCmd = program.command("auth").description("Manage NVIDIA authentication");
 
 authCmd
@@ -213,7 +273,8 @@ authCmd
 program
   .command("doctor")
   .description("Run environment and API diagnostic checks")
-  .action(async () => {
+  .option("--rate-limit", "Include rate limit status check")
+  .action(async (options) => {
     console.log(chalk.bold.cyan("\nNV Doctor Diagnostic Tool\n"));
     const report = await runDoctorCheck();
 
@@ -229,6 +290,14 @@ program
         console.log(`   ${chalk.dim(item.message)}`);
       }
     }
+
+    if (options.rateLimit) {
+      const scheduler = provider.getScheduler();
+      const cfg = scheduler.getDomainManager().getConfig();
+      console.log(chalk.bold.cyan("\n[Rate Limit Scheduler Summary]"));
+      console.log(`Mode: ${cfg.mode} | Fallback RPM: ${cfg.fallbackRpm} | Max Concurrency: ${cfg.maxConcurrency}`);
+    }
+
     console.log();
   });
 
