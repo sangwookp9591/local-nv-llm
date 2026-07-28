@@ -9,6 +9,7 @@ import { runNonInteractivePrompt } from "./commands/non-interactive.js";
 import { maskApiKey } from "./auth/redaction.js";
 import { SessionStore } from "./sessions/session-store.js";
 import { PatchManager } from "./agent/patch-manager.js";
+import { TerminalRepl } from "./terminal/repl.js";
 
 const program = new Command();
 const credStore = new CredentialStore();
@@ -94,10 +95,23 @@ async function runCliSession(options: {
     return;
   }
 
-  // Interactive Mode header
+  // Interactive Mode header & REPL start
   console.log(chalk.cyan.bold(`\nNV Terminal AI (${mode.toUpperCase()} MODE)`));
   console.log(chalk.dim(`Model: ${config.defaultModel} | Directory: ${cwd}\n`));
   console.log(chalk.yellow("대화형 셸 준비 완료. (/help 명령어로 사용 가능 도움말 확인)\n"));
+
+  const repl = new TerminalRepl({
+    provider,
+    apiKey: activeApiKey,
+    sessionStore,
+    patchManager,
+    cwd,
+    modelId: config.defaultModel,
+    mode,
+    planMode: options.plan,
+  });
+
+  await repl.start();
 }
 
 program
