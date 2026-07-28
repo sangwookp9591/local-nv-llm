@@ -16,6 +16,9 @@ import { PermissionManager } from "../permissions/permission-manager.js";
 import { ProjectDiscovery } from "../project/project-discovery.js";
 import { GoalRuntime } from "../goal/goal-runtime.js";
 import { AgentOrchestrator } from "../orchestration/orchestrator.js";
+import { RuntimeEventBus } from "../status/event-bus.js";
+import { RuntimeStateStore } from "../status/state-store.js";
+import { TerminalStatusBar } from "../status/status-bar.js";
 
 export interface ReplOptions {
   provider: LlmProvider;
@@ -38,6 +41,9 @@ export class TerminalRepl {
   private projectDiscovery: ProjectDiscovery;
   private goalRuntime: GoalRuntime;
   private orchestrator: AgentOrchestrator;
+  private eventBus: RuntimeEventBus;
+  private stateStore: RuntimeStateStore;
+  private statusBar: TerminalStatusBar;
   private verbose = false;
 
   constructor(options: ReplOptions) {
@@ -48,6 +54,10 @@ export class TerminalRepl {
     this.projectDiscovery = new ProjectDiscovery(options.cwd);
     this.goalRuntime = new GoalRuntime();
     this.orchestrator = new AgentOrchestrator();
+
+    this.eventBus = new RuntimeEventBus();
+    this.stateStore = new RuntimeStateStore(this.eventBus);
+    this.statusBar = new TerminalStatusBar(this.stateStore);
 
     const existing = options.sessionStore.getLatestSession(options.cwd);
     if (existing) {
@@ -77,6 +87,7 @@ export class TerminalRepl {
       )
     );
 
+    this.renderStatusBar();
     rl.prompt();
 
     for await (const line of rl) {
@@ -94,6 +105,7 @@ export class TerminalRepl {
           rl.close();
           break;
         }
+        this.renderStatusBar();
         rl.prompt();
         continue;
       }
@@ -102,6 +114,7 @@ export class TerminalRepl {
       const localIntent = detectLocalIntent(trimmed);
       if (localIntent) {
         await this.handleLocalIntent(localIntent);
+        this.renderStatusBar();
         rl.prompt();
         continue;
       }
@@ -109,7 +122,15 @@ export class TerminalRepl {
       // 3. LLM Agent Runtime execution
       await this.handleUserPrompt(trimmed);
       this.options.sessionStore.saveSession(this.session);
+      this.renderStatusBar();
       rl.prompt();
+    }
+  }
+
+  private renderStatusBar(): void {
+    const barText = this.statusBar.renderBarText();
+    if (barText) {
+      console.log(`\n${barText}\n`);
     }
   }
 
@@ -170,6 +191,22 @@ export class TerminalRepl {
       case "exit":
         console.log(chalk.yellow("NV CLI를 종료합니다. 세션이 저장되었습니다."));
         return true;
+
+      case "status": {
+        const sub = slash.args.trim();
+        if (sub === "compact" || sub === "normal" || sub === "expanded" || sub === "off") {
+          this.statusBar.setMode(sub);
+          console.log(chalk.green(`✓ Status Bar 모드가 '${sub}'(으)로 변경되었습니다.`));
+          if (sub === "expanded") {
+            console.log(`\n${this.statusBar.renderExpandedPanel()}\n`);
+          }
+        } else if (sub === "expanded") {
+          console.log(`\n${this.statusBar.renderExpandedPanel()}\n`);
+        } else {
+          await this.handleLocalIntent("CURRENT_STATUS");
+        }
+        return false;
+      }
 
       case "verbose": {
         if (slash.args === "on") {
@@ -236,11 +273,19 @@ export class TerminalRepl {
           const active = this.goalRuntime.getActiveGoal();
           if (active) {
             this.goalRuntime.cancelGoal(active.id);
+            this.eventBus.emit("GOAL_STATUS_CHANGED", { goalId: active.id, status: "CANCELLED" });
             console.log(chalk.yellow(`✓ Goal (${active.id}) 취소 완료.`));
           }
         } else {
           // Create new goal
           const newGoal = this.goalRuntime.createGoal(slash.args, 30);
+          this.eventBus.emit("GOAL_STATUS_CHANGED", {
+            goalId: newGoal.id,
+            objective: newGoal.objective,
+            status: "RUNNING",
+            completedTasks: 0,
+            totalTasks: 10,
+          });
           console.log(chalk.bold.green(`\n✓ Goal이 생성되었습니다!`));
           console.log(`ID: ${newGoal.id}`);
           console.log(`목표: ${newGoal.objective}`);
@@ -333,10 +378,6 @@ export class TerminalRepl {
         return false;
       }
 
-      case "status":
-        await this.handleLocalIntent("CURRENT_STATUS");
-        return false;
-
       case "model":
         if (slash.args) {
           this.session.modelId = slash.args.trim();
@@ -424,6 +465,7 @@ export class TerminalRepl {
           process.stdout.write(redactSensitiveText(chunk, [this.options.apiKey]));
         },
         onToolStart: (name, args) => {
+          this.eventBus.emit("TOOL_STARTED", { toolName: name, filePath: (args as any)?.path });
           const fp = this.circuitBreaker.createFingerprint(name, args, this.options.cwd);
           if (this.circuitBreaker.shouldBlock(fp.hash)) {
             console.log(
