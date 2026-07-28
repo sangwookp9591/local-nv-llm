@@ -11,6 +11,11 @@ import { PatchManager } from "../agent/patch-manager.js";
 import { AgentLoop } from "../agent/agent-loop.js";
 import { maskApiKey, redactSensitiveText } from "../auth/redaction.js";
 import { NvidiaProvider } from "../providers/nvidia/client.js";
+import { CircuitBreaker } from "../harness/circuit-breaker.js";
+import { PermissionManager } from "../permissions/permission-manager.js";
+import { ProjectDiscovery } from "../project/project-discovery.js";
+import { GoalRuntime } from "../goal/goal-runtime.js";
+import { AgentOrchestrator } from "../orchestration/orchestrator.js";
 
 export interface ReplOptions {
   provider: LlmProvider;
@@ -28,10 +33,21 @@ export class TerminalRepl {
   private contextManager: ContextManager;
   private session: SessionData;
   private toolRegistry: ToolRegistry;
+  private circuitBreaker: CircuitBreaker;
+  private permissionManager: PermissionManager;
+  private projectDiscovery: ProjectDiscovery;
+  private goalRuntime: GoalRuntime;
+  private orchestrator: AgentOrchestrator;
+  private verbose = false;
 
   constructor(options: ReplOptions) {
     this.options = options;
     this.toolRegistry = new ToolRegistry(options.cwd, options.patchManager);
+    this.circuitBreaker = new CircuitBreaker(2);
+    this.permissionManager = new PermissionManager({ allowedRoots: [options.cwd] });
+    this.projectDiscovery = new ProjectDiscovery(options.cwd);
+    this.goalRuntime = new GoalRuntime();
+    this.orchestrator = new AgentOrchestrator();
 
     const existing = options.sessionStore.getLatestSession(options.cwd);
     if (existing) {
@@ -139,6 +155,7 @@ export class TerminalRepl {
         console.log(`Mode: ${this.session.mode.toUpperCase()}`);
         console.log(`Directory: ${this.options.cwd}`);
         console.log(`Session ID: ${this.session.id}`);
+        console.log(`Orchestration: ${this.orchestrator.isEnabled() ? "ON" : "OFF"}`);
         console.log(`API Key: ${maskApiKey(this.options.apiKey)}\n`);
         break;
       }
@@ -153,6 +170,101 @@ export class TerminalRepl {
       case "exit":
         console.log(chalk.yellow("NV CLI를 종료합니다. 세션이 저장되었습니다."));
         return true;
+
+      case "verbose": {
+        if (slash.args === "on") {
+          this.verbose = true;
+          console.log(chalk.green("✓ Verbose 로그 모드가 활성화되었습니다."));
+        } else if (slash.args === "off") {
+          this.verbose = false;
+          console.log(chalk.yellow("✓ Verbose 로그 모드가 비활성화되었습니다."));
+        } else {
+          console.log(`현재 Verbose 모드: ${this.verbose ? "ON" : "OFF"}`);
+        }
+        return false;
+      }
+
+      case "permissions": {
+        const parts = slash.args.trim().split(/\s+/);
+        const sub = parts[0];
+        if (sub === "list" || !sub) {
+          const grants = this.permissionManager.listGrants();
+          console.log(chalk.bold.cyan("\n[현재 승인된 접근 권한 목록]"));
+          if (grants.length === 0) {
+            console.log(chalk.dim("추가로 승인된 경로 권한이 없습니다. (현재 프로젝트 루트만 허용)"));
+          } else {
+            grants.forEach((g) => {
+              console.log(`- ${g.path} (${g.modes.join(",")}) [Scope: ${g.scope}]`);
+            });
+          }
+          console.log();
+        } else if (sub === "clear-session") {
+          this.permissionManager.clearSessionPermissions();
+          console.log(chalk.green("✓ 세션 범위 권한이 정원 초기화되었습니다."));
+        }
+        return false;
+      }
+
+      case "project": {
+        const sub = slash.args.trim();
+        if (sub === "detect" || !sub) {
+          const root = this.projectDiscovery.detectProjectRoot();
+          console.log(chalk.bold.cyan(`\n감지된 프로젝트 루트: ${root || this.options.cwd}`));
+          const candidates = this.projectDiscovery.findCandidates();
+          if (candidates.length > 0) {
+            console.log(chalk.dim("하위 프로젝트 후보:"));
+            candidates.forEach((c) => console.log(`  - ${c.name} (${c.path}) [${c.marker}]`));
+          }
+          console.log();
+        }
+        return false;
+      }
+
+      case "goal": {
+        if (!slash.args || slash.args === "status") {
+          const active = this.goalRuntime.getActiveGoal();
+          if (active) {
+            console.log(chalk.bold.cyan(`\n[현재 활성 Goal 상태]`));
+            console.log(`Goal ID: ${active.id}`);
+            console.log(`Objective: ${active.objective}`);
+            console.log(`Status: ${active.status.toUpperCase()}`);
+            console.log(`Step: ${active.currentStep}/${active.maxSteps}\n`);
+          } else {
+            console.log(chalk.dim("활성화된 Goal이 없습니다. '/goal <목표>'로 새 목표를 시작하세요."));
+          }
+        } else if (slash.args.startsWith("cancel")) {
+          const active = this.goalRuntime.getActiveGoal();
+          if (active) {
+            this.goalRuntime.cancelGoal(active.id);
+            console.log(chalk.yellow(`✓ Goal (${active.id}) 취소 완료.`));
+          }
+        } else {
+          // Create new goal
+          const newGoal = this.goalRuntime.createGoal(slash.args, 30);
+          console.log(chalk.bold.green(`\n✓ Goal이 생성되었습니다!`));
+          console.log(`ID: ${newGoal.id}`);
+          console.log(`목표: ${newGoal.objective}`);
+          console.log(chalk.dim("Agent 모드로 자동 전환하여 자율 엔지니어링 루프를 구동합니다.\n"));
+          this.session.mode = "agent";
+        }
+        return false;
+      }
+
+      case "orchestration": {
+        const sub = slash.args.trim();
+        if (sub === "on") {
+          this.orchestrator.setEnabled(true);
+          console.log(chalk.green("✓ Multi-Agent Orchestration이 활성화되었습니다."));
+        } else if (sub === "off") {
+          this.orchestrator.setEnabled(false);
+          console.log(chalk.yellow("✓ Multi-Agent Orchestration이 비활성화되었습니다."));
+        } else {
+          console.log(
+            chalk.bold.cyan(`\nOrchestration: ${this.orchestrator.isEnabled() ? "ON" : "OFF"}\n`)
+          );
+        }
+        return false;
+      }
 
       case "clear":
         console.clear();
@@ -213,8 +325,8 @@ export class TerminalRepl {
           console.log(`Total Model Calls: ${metrics.totalRequests}`);
           console.log(`Successful: ${metrics.successfulRequests}`);
           console.log(`Retried: ${metrics.retriedRequests}`);
-          console.log(`HTTP 429 Count: ${metrics.rateLimited429Count}`);
-          console.log(`HTTP 503 Count: ${metrics.serverError503Count}`);
+          console.log(`HTTP 429: ${metrics.rateLimited429Count}`);
+          console.log(`HTTP 503: ${metrics.serverError503Count}`);
           console.log(`Total Queued Time: ${(metrics.totalQueuedMs / 1000).toFixed(1)}s`);
           console.log(`Total API Exec Time: ${(metrics.totalExecutionMs / 1000).toFixed(1)}s\n`);
         }
@@ -311,14 +423,24 @@ export class TerminalRepl {
         onChunk: (chunk) => {
           process.stdout.write(redactSensitiveText(chunk, [this.options.apiKey]));
         },
-        onToolStart: (name) => {
-          console.log(chalk.yellow(`\n◆ ${name} 실행 중...`));
+        onToolStart: (name, args) => {
+          const fp = this.circuitBreaker.createFingerprint(name, args, this.options.cwd);
+          if (this.circuitBreaker.shouldBlock(fp.hash)) {
+            console.log(
+              chalk.red(`\n⚠ [Circuit Breaker] ${name} 도구가 연속 반복 실패로 차단되었습니다.`)
+            );
+          } else if (this.verbose) {
+            console.log(chalk.yellow(`\n◆ ${name} 실행 중... (${JSON.stringify(args)})`));
+          }
         },
         onToolEnd: (name, output, success) => {
+          const fp = this.circuitBreaker.createFingerprint(name, {}, this.options.cwd);
           if (success) {
-            console.log(chalk.green(`✓ ${name} 성공`));
+            this.circuitBreaker.recordSuccess(fp.hash);
+            if (this.verbose) console.log(chalk.green(`✓ ${name} 성공`));
           } else {
-            console.log(chalk.red(`✗ ${name} 실패: ${output}`));
+            this.circuitBreaker.recordFailure(fp.hash, "COMMAND_FAILED");
+            if (this.verbose) console.log(chalk.red(`✗ ${name} 실패: ${output}`));
           }
         },
       });

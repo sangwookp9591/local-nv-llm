@@ -10,6 +10,10 @@ import { maskApiKey } from "./auth/redaction.js";
 import { SessionStore } from "./sessions/session-store.js";
 import { PatchManager } from "./agent/patch-manager.js";
 import { TerminalRepl } from "./terminal/repl.js";
+import { PermissionManager } from "./permissions/permission-manager.js";
+import { ProjectDiscovery } from "./project/project-discovery.js";
+import { GoalRuntime } from "./goal/goal-runtime.js";
+import { AgentOrchestrator } from "./orchestration/orchestrator.js";
 
 const program = new Command();
 const credStore = new CredentialStore();
@@ -17,6 +21,10 @@ const configStore = new ConfigStore();
 const provider = new NvidiaProvider();
 const sessionStore = new SessionStore();
 const patchManager = new PatchManager();
+const permManager = new PermissionManager();
+const projDiscovery = new ProjectDiscovery();
+const goalRuntime = new GoalRuntime();
+const orchestrator = new AgentOrchestrator();
 
 async function ensureAuthenticated(): Promise<string> {
   const cred = credStore.getApiKeyInfo();
@@ -128,7 +136,7 @@ program
     await runCliSession({ ...options, mode: "chat" });
   });
 
-// nv agent subcommand
+// Subcommands
 program
   .command("agent")
   .description("Run NV in Agent mode (Tool Calling, File edits, Patch tracking)")
@@ -140,7 +148,6 @@ program
     await runCliSession({ ...options, mode: "agent" });
   });
 
-// nv chat subcommand
 program
   .command("chat")
   .description("Run NV in Chat mode (General conversation & Q&A)")
@@ -151,7 +158,70 @@ program
     await runCliSession({ ...options, mode: "chat" });
   });
 
-// nv limits subcommand
+program
+  .command("permissions")
+  .description("Manage path permissions and grants")
+  .action(() => {
+    const grants = permManager.listGrants();
+    console.log(chalk.bold.cyan("\n[승인된 경로 권한 목록]"));
+    if (grants.length === 0) {
+      console.log(chalk.dim("추가로 승인된 경로 권한이 없습니다. (현재 프로젝트 루트만 기본 허용)"));
+    } else {
+      grants.forEach((g) => console.log(`- ${g.path} (${g.modes.join(",")}) [${g.scope}]`));
+    }
+    console.log();
+  });
+
+program
+  .command("project")
+  .description("Detect project root or list sub-project candidates")
+  .action(() => {
+    const root = projDiscovery.detectProjectRoot();
+    console.log(chalk.bold.cyan(`\n감지된 프로젝트 루트: ${root || process.cwd()}`));
+    const candidates = projDiscovery.findCandidates();
+    if (candidates.length > 0) {
+      console.log(chalk.dim("하위 프로젝트 후보:"));
+      candidates.forEach((c) => console.log(`  - ${c.name} (${c.path}) [${c.marker}]`));
+    }
+    console.log();
+  });
+
+program
+  .command("goal")
+  .description("Manage autonomous engineering goals")
+  .argument("[objective...]", "Goal objective text")
+  .action(async (objectiveParts: string[]) => {
+    const objective = objectiveParts.join(" ");
+    if (!objective) {
+      const active = goalRuntime.getActiveGoal();
+      if (active) {
+        console.log(chalk.bold.cyan(`\n[현재 활성 Goal 상태]`));
+        console.log(`Goal ID: ${active.id}`);
+        console.log(`Objective: ${active.objective}`);
+        console.log(`Status: ${active.status.toUpperCase()}`);
+        console.log(`Step: ${active.currentStep}/${active.maxSteps}\n`);
+      } else {
+        console.log(chalk.dim("활성화된 Goal이 없습니다. 'nv goal <목표>'로 실행하세요."));
+      }
+      return;
+    }
+
+    const goal = goalRuntime.createGoal(objective, 30);
+    console.log(chalk.bold.green(`\n✓ Goal이 생성되었습니다!`));
+    console.log(`ID: ${goal.id}`);
+    console.log(`목표: ${goal.objective}\n`);
+    await runCliSession({ mode: "agent" });
+  });
+
+program
+  .command("orchestration")
+  .description("Manage Multi-Agent Orchestration status")
+  .action(() => {
+    console.log(
+      chalk.bold.cyan(`\nMulti-Agent Orchestration Status: ${orchestrator.isEnabled() ? "ON" : "OFF"}\n`)
+    );
+  });
+
 const limitsCmd = program.command("limits").description("Check or configure Rate Limit settings");
 
 limitsCmd
@@ -182,7 +252,6 @@ limitsCmd
     console.log(chalk.green("✓ Rate limit metrics and adaptive states reset."));
   });
 
-// nv queue subcommand
 program
   .command("queue")
   .description("Show current pending request queue")
@@ -191,7 +260,6 @@ program
     console.log(chalk.cyan(`\nPending Request Queue: ${scheduler.getQueueLength()} items\n`));
   });
 
-// nv usage subcommand
 program
   .command("usage")
   .description("Show API call usage metrics")
@@ -208,7 +276,6 @@ program
     console.log(`API Exec Time: ${(metrics.totalExecutionMs / 1000).toFixed(1)}s\n`);
   });
 
-// Auth Subcommands
 const authCmd = program.command("auth").description("Manage NVIDIA authentication");
 
 authCmd

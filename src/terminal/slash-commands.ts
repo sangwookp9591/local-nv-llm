@@ -32,6 +32,11 @@ export const KNOWN_SLASH_COMMANDS = [
   "usage",
   "retries",
   "continue",
+  "permissions",
+  "project",
+  "goal",
+  "orchestration",
+  "verbose",
 ];
 
 export function parseSlashCommand(input: string): SlashCommand | null {
