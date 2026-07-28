@@ -19,6 +19,7 @@ import { AgentOrchestrator } from "../orchestration/orchestrator.js";
 import { RuntimeEventBus } from "../status/event-bus.js";
 import { RuntimeStateStore } from "../status/state-store.js";
 import { TerminalStatusBar } from "../status/status-bar.js";
+import { formatHeaderBanner, formatToolBox } from "./ui-theme.js";
 
 export interface ReplOptions {
   provider: LlmProvider;
@@ -75,18 +76,23 @@ export class TerminalRepl {
   }
 
   public async start(): Promise<void> {
+    console.clear();
+    console.log(
+      formatHeaderBanner({
+        version: "1.0.0",
+        model: this.session.modelId,
+        mode: this.session.mode,
+        cwd: this.options.cwd,
+      })
+    );
+
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
-      prompt: chalk.cyan("› "),
+      prompt: chalk.cyan.bold("\n❯ "),
     });
 
-    console.log(
-      chalk.dim(
-        `대화 세션이 시작되었습니다. (/help 명령어 목록, /exit 또는 Ctrl+C 종료)\n`
-      )
-    );
-
+    console.log();
     this.renderStatusBar();
     rl.prompt();
 
@@ -137,7 +143,7 @@ export class TerminalRepl {
   private async handleLocalIntent(intent: string): Promise<void> {
     switch (intent) {
       case "LIST_MODELS": {
-        console.log(chalk.bold.cyan("\n사용 가능한 NVIDIA 모델 목록\n"));
+        console.log(chalk.bold.cyan("\n✦ 사용 가능한 NVIDIA 모델 목록\n"));
         console.log(`현재 선택된 모델: ● ${chalk.green(this.session.modelId)}\n`);
         try {
           const models = await this.options.provider.listModels(this.options.apiKey);
@@ -313,11 +319,13 @@ export class TerminalRepl {
 
       case "clear":
         console.clear();
-        console.log(chalk.cyan.bold("\nNV Terminal AI"));
         console.log(
-          chalk.dim(
-            `Model: ${this.session.modelId} | Mode: ${this.session.mode.toUpperCase()} | Directory: ${this.options.cwd}\n`
-          )
+          formatHeaderBanner({
+            version: "1.0.0",
+            model: this.session.modelId,
+            mode: this.session.mode,
+            cwd: this.options.cwd,
+          })
         );
         return false;
 
@@ -447,7 +455,7 @@ export class TerminalRepl {
     const systemPrompt = buildSystemPrompt(runtimeContext);
     const messages = this.contextManager.getEffectiveMessages(systemPrompt);
 
-    console.log(chalk.blue.bold("\nNV:"));
+    console.log(chalk.cyan.bold("\n✦ NV:"));
 
     const agentLoop = new AgentLoop({
       provider: this.options.provider,
@@ -471,18 +479,18 @@ export class TerminalRepl {
             console.log(
               chalk.red(`\n⚠ [Circuit Breaker] ${name} 도구가 연속 반복 실패로 차단되었습니다.`)
             );
-          } else if (this.verbose) {
-            console.log(chalk.yellow(`\n◆ ${name} 실행 중... (${JSON.stringify(args)})`));
+          } else {
+            console.log(`\n${formatToolBox(name, args, "running")}`);
           }
         },
         onToolEnd: (name, output, success) => {
           const fp = this.circuitBreaker.createFingerprint(name, {}, this.options.cwd);
           if (success) {
             this.circuitBreaker.recordSuccess(fp.hash);
-            if (this.verbose) console.log(chalk.green(`✓ ${name} 성공`));
+            console.log(formatToolBox(name, {}, "success", undefined, output));
           } else {
             this.circuitBreaker.recordFailure(fp.hash, "COMMAND_FAILED");
-            if (this.verbose) console.log(chalk.red(`✗ ${name} 실패: ${output}`));
+            console.log(formatToolBox(name, {}, "error", undefined, output));
           }
         },
       });
